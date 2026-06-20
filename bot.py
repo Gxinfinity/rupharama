@@ -31,7 +31,7 @@ structlog.configure(
 log = structlog.get_logger()
 
 # ─────────────────────────────────────────────
-#  ENV CONFIG & PROXIES 
+#  ENV CONFIG & PROXIES
 # ─────────────────────────────────────────────
 API_ID    = int(os.getenv("API_ID", "0"))
 API_HASH  = os.getenv("API_HASH", "")
@@ -117,11 +117,7 @@ MATERIAL_TYPES = {
     "books":    "📗 Reference Books PDF",
 }
 
-TELEGRAM_CHANNELS = [
-    "pharmacist_pyq", "pharma_exam_material", "aiims_pharmacist_pyq",
-    "drug_inspector_notes", "pharmacy_exam_pdf", "gpat_material",
-    "pharmacist_exam_zone", "pharma_study_hub",
-]
+TELEGRAM_CHANNELS = []  # Disabled: Telegram scraping can expose leaked/copyrighted paid material.
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -137,15 +133,15 @@ SESSION:    Optional[aiohttp.ClientSession] = None
 REDIS:      Optional[aioredis.Redis]        = None
 MONGO_DB                                    = None
 
-DOWNLOAD_QUEUE     = asyncio.Queue(maxsize=200)
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)
-SCRAPE_SEMAPHORE   = asyncio.Semaphore(8)   
+DOWNLOAD_QUEUE     = asyncio.Queue(maxsize=500)
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(10)
+SCRAPE_SEMAPHORE   = asyncio.Semaphore(20)
 
 DOMAIN_LIMITS = {
     "google": asyncio.Semaphore(2),
-    "bing": asyncio.Semaphore(3),
-    "ddg": asyncio.Semaphore(4),
-    "telegram": asyncio.Semaphore(3)
+    "bing": asyncio.Semaphore(8),
+    "ddg": asyncio.Semaphore(8),
+    "official": asyncio.Semaphore(10),
 }
 
 # ADDED BUG FIX: Adaptive Domain Penalties
@@ -153,8 +149,22 @@ DOMAIN_PENALTY = {
     "google": 0.0,
     "bing": 0.0,
     "ddg": 0.0,
-    "telegram": 0.0
+    "official": 0.0,
 }
+
+# Copyright-safe source policy: the bot may aggregate public/official/free resources,
+# but must not scrape or redistribute leaked paid coaching material or Telegram dumps.
+LEGAL_SOURCE_DOMAINS = (
+    "gov.in", "nic.in", "ac.in", "edu", "aiimsexams.ac.in",
+    "docs.aiimsexams.ac.in", "rrbcdg.gov.in", "tnpsc.gov.in",
+    "youtube.com", "youtu.be", "archive.org",
+)
+BLOCKED_DOMAINS = ("t.me", "telegram.me", "scribd.com", "studocu.com")
+BLOCKED_TEXT = (
+    "paid batch", "premium batch", "allen", "physics wallah", "pw batch",
+    "leaked", "crack pdf", "pirated", "telegram premium", "unauthorized",
+)
+MAX_RESULTS_PER_SEARCH = int(os.getenv("MAX_RESULTS_PER_SEARCH", "1000"))
 
 ACTIVE_DL      = 0
 BURST_WORKERS  = 0
@@ -229,7 +239,7 @@ async def redis_get(key: str) -> Optional[bytes]:
         return None
     try:
         val = await REDIS.get(key)
-        return val  
+        return val
     except Exception:
         return None
 
@@ -289,6 +299,24 @@ def _host_is_safe(host: str) -> bool:
 def safe_host(host: str) -> bool:
     return valid_url("http://" + host)
 
+
+def source_policy(url: str, title: str = "") -> str:
+    text = f"{url} {title}".lower()
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    if any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS):
+        return "blocked"
+    if any(term in text for term in BLOCKED_TEXT):
+        return "blocked"
+    if any(host == d or host.endswith("." + d) or d in host for d in LEGAL_SOURCE_DOMAINS):
+        return "trusted"
+    return "public_link"
+
+def is_source_allowed(url: str, title: str = "") -> bool:
+    return source_policy(url, title) != "blocked"
+
+def is_probably_pdf_url(url: str) -> bool:
+    return ".pdf" in url.lower() or urlparse(url).path.lower().endswith(".pdf")
+
 def valid_url(url: str) -> bool:
     try:
         p = urlparse(url)
@@ -307,10 +335,10 @@ def get_random_proxy() -> Optional[str]:
             PROXY_FAILS[p] = 0
             PROXY_LATENCY[p] = 5.0
         valid_proxies = PROXIES
-    
+
     # Sort by lowest latency and highest success
     valid_proxies.sort(key=lambda p: (PROXY_LATENCY.get(p, 5.0), -PROXY_SUCCESS.get(p, 0)))
-    
+
     # Pick from top 3 to keep randomness but prioritize speed
     return random.choice(valid_proxies[:3])
 
@@ -333,14 +361,14 @@ async def safe_get(url: str, headers: Optional[dict] = None,
         return None
     h = headers or {"User-Agent": random.choice(USER_AGENTS)}
     t = timeout or aiohttp.ClientTimeout(total=25)
-    
+
     req_proxy = get_random_proxy()
     start_time = time.time()
-    
+
     try:
         resp = await SESSION.get(url, headers=h, timeout=t, allow_redirects=True, proxy=req_proxy)
         latency = time.time() - start_time
-        
+
         if resp.status in (429, 403) or "captcha" in str(resp.url).lower():
             mark_proxy_failed(req_proxy)
         else:
@@ -352,7 +380,7 @@ async def safe_get(url: str, headers: Optional[dict] = None,
                     resp.close()
                     log.warning("ssrf_redirect_history_blocked", url=str(r.url))
                     return None
-                    
+
         final_url = str(resp.url)
         if not valid_url(final_url):
             resp.close()
@@ -422,7 +450,7 @@ def relieve_domain_penalty(domain: str):
     DOMAIN_PENALTY[domain] = max(DOMAIN_PENALTY.get(domain, 0.0) - 0.1, 0.0)
 
 # ─────────────────────────────────────────────
-#  SCRAPERS 
+#  SCRAPERS
 # ─────────────────────────────────────────────
 def match_keywords(text: str, kw_words: list) -> bool:
     return any(w in text.lower() for w in kw_words)
@@ -447,7 +475,7 @@ async def scrape_ddg(query: str) -> List[Dict]:
                     html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 for a in soup.find_all("a", class_="result__a"):
-                    await asyncio.sleep(0)  
+                    await asyncio.sleep(0)
                     href = a.get("href", "")
                     if "uddg=" in href:
                         href = unquote(href.split("uddg=")[1].split("&")[0])
@@ -474,7 +502,7 @@ async def scrape_bing(query: str) -> List[Dict]:
                     html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
                 for li in soup.find_all("li", class_="b_algo"):
-                    await asyncio.sleep(0)  
+                    await asyncio.sleep(0)
                     a = li.find("a")
                     if a:
                         href = a.get("href", "")
@@ -510,7 +538,7 @@ async def scrape_google(query: str) -> List[Dict]:
 
                 for sel in [["yuRUbf"], ["tF2Cxc"], ["g"]]:
                     for div in soup.find_all("div", class_=sel):
-                        await asyncio.sleep(0)  
+                        await asyncio.sleep(0)
                         a = div.find("a", href=True)
                         if not a:
                             continue
@@ -526,7 +554,7 @@ async def scrape_google(query: str) -> List[Dict]:
 
                 if not results:
                     for a in soup.find_all("a", href=True):
-                        await asyncio.sleep(0)  
+                        await asyncio.sleep(0)
                         href = a["href"]
                         if href.startswith("/url?q="):
                             href = unquote(href[7:].split("&")[0])
@@ -556,15 +584,15 @@ async def scrape_telegram(keyword: str) -> List[Dict]:
                         html = await resp.text()
                     soup = BeautifulSoup(html, "html.parser")
                     for msg in soup.find_all("div", class_="tgme_widget_message_wrap"):
-                        await asyncio.sleep(0)  
+                        await asyncio.sleep(0)
                         el = msg.find("div", class_="tgme_widget_message_text")
                         if not el:
                             continue
                         text = el.get_text(" ", strip=True)
-                        
+
                         if not match_keywords(text, kw_words):
                             continue
-                            
+
                         a = msg.find("a", href=True)
                         link = a["href"] if a else f"https://t.me/{channel}"
                         results.append({
@@ -611,12 +639,12 @@ async def full_search(exam_key: str, exam_label: str, region: str,
     log.info("live_search", exam=exam_key, region=region, year=year, mat=mat)
 
     tasks = []
-    for q in queries[:4]:          
+    for q in queries[:4]:
         tasks.append(scrape_ddg(q))
         tasks.append(scrape_bing(q))
     for q in queries[:2]:
         tasks.append(scrape_google(q))
-    tasks.append(scrape_telegram(f"{exam_label} {region} pharmacist {year or ''}"))
+    # Telegram scraping intentionally disabled to avoid redistributing leaked paid material.
 
     await asyncio.sleep(0.2)
     batch = await asyncio.gather(*tasks, return_exceptions=True)
@@ -628,17 +656,17 @@ async def full_search(exam_key: str, exam_label: str, region: str,
     seen: set = set()
     bad_words = {"admit card", "notification", "recruitment", "registration",
                  "vacancy", "apply online", "jobs", "hall ticket", "login"}
-    
+
     # ADDED BUG FIX: TF-IDF Lite Smart Ranking Data Extraction
     rank_keywords = [w.lower() for w in exam_label.split() + region.split()]
     if year:
         rank_keywords.append(str(year))
-        
+
     scored: List[Dict] = []
     for item in all_results:
-        await asyncio.sleep(0)  
+        await asyncio.sleep(0)
         url = item.get("url", "")
-        if not url or url in seen or not valid_url(url):
+        if not url or url in seen or not valid_url(url) or not is_source_allowed(url, item.get("title", "")):
             continue
         seen.add(url)
         t_l  = item.get("title", "").lower()
@@ -648,23 +676,23 @@ async def full_search(exam_key: str, exam_label: str, region: str,
         score = 0
         if ".pdf" in u_l:                                           score += 10
         if any(d in u_l for d in ["gov.in","nic.in","ac.in",".edu"]): score += 6
-        if "telegram" in item.get("source","").lower():             score += 3
+        if source_policy(url, item.get("title", "")) == "trusted":       score += 12
         if year and str(year) in u_l:                               score += 4
         if "pharmacist" in u_l:                                     score += 2
-        
+
         # Smart Keyword Frequency Boost (TF-IDF lite)
         keyword_matches = sum(1 for w in rank_keywords if w in t_l or w in u_l)
         score += (keyword_matches * 5)
-        
+
         item["score"] = score
         scored.append(item)
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-    final = scored[:500]
+    final = scored[:MAX_RESULTS_PER_SEARCH]
     log.info("search_done", raw=len(all_results), final=len(final))
 
     if final:
-        compressed = compress(final)   
+        compressed = compress(final)
         await redis_set(f"res:{sid}", compressed)
         if MONGO_DB is not None:
             try:
@@ -712,7 +740,7 @@ async def load_session(sid: str) -> Optional[List[Dict]]:
     if sid in SESSION_EXPIRY and SESSION_EXPIRY[sid] < time.time():
         SESSION_MAP.pop(sid, None)
         SESSION_EXPIRY.pop(sid, None)
-        
+
     if sid in SESSION_MAP:
         return decompress(SESSION_MAP[sid])
     if MONGO_DB is not None:
@@ -751,7 +779,7 @@ async def session_cleanup_task():
                 asyncio.create_task(download_worker(STOP_EVENT), name=f"burst_dl_{BURST_WORKERS}")
                 BURST_WORKERS += 1
                 log.info("spawned_burst_worker", total_burst=BURST_WORKERS)
-            
+
         now = time.time()
         for k in list(SESSION_EXPIRY.keys()):
             if SESSION_EXPIRY[k] < now:
@@ -842,7 +870,7 @@ def results_kb(results: List[Dict], page: int,
     return InlineKeyboardMarkup(rows)
 
 # ─────────────────────────────────────────────
-#  DOWNLOAD WORKER 
+#  DOWNLOAD WORKER
 # ─────────────────────────────────────────────
 def safe_task_done():
     try:
@@ -888,7 +916,7 @@ async def download_worker(stop_event: asyncio.Event):
             continue
 
         client_ref, chat_id, url, title, user_id = task
-        tmp_path = None   
+        tmp_path = None
         sent_ok  = False
 
         try:
@@ -958,8 +986,20 @@ async def download_worker(stop_event: asyncio.Event):
                             sent_ok = True
                             return
 
+                        async with aiofiles.open(tmp_path, "rb") as f:
+                            header = await f.read(5)
+                            await f.seek(max(0, size - 2048))
+                            tail = await f.read()
+                        if header != b"%PDF-" or b"%%EOF" not in tail:
+                            await worker_safe_send(
+                                client_ref, chat_id,
+                                f"🛡️ Blocked unsafe or corrupted PDF. Open source link instead:\n{url}"
+                            )
+                            sent_ok = True
+                            return
+
                     safe_name = re.sub(r"[^\w\s\-]", "", title)[:60].strip() + ".pdf"
-                    
+
                     await worker_safe_doc(
                         client_ref, chat_id, tmp_path, safe_name,
                         f"📄 **{title[:180]}**\n📦 {size // 1024} KB\n🔗 {url[:100]}"
@@ -992,7 +1032,7 @@ async def download_worker(stop_event: asyncio.Event):
 # ─────────────────────────────────────────────
 #  COMMAND HANDLERS
 # ─────────────────────────────────────────────
-@app.on_message(filters.command("start") & filters.private)
+@app.on_message(filters.command("start") & (filters.private | filters.group))
 @safe
 async def cmd_start(_, msg: Message):
     if await is_rate_limited(msg.from_user.id, "start", 5):
@@ -1004,12 +1044,13 @@ async def cmd_start(_, msg: Message):
         "✅ AIIMS CRE (14 institutes) | ESIC | DSSSB | NHM\n"
         "✅ Drug Inspector | GPAT | State PSC (9 boards)\n"
         "✅ PYQ | Syllabus | Notes | Answer Keys | Mock | Books\n\n"
-        "🔍 Google + Bing + DDG + Telegram Channels\n\n"
+        "🔍 Google + Bing + DDG + official/public sources\n"
+        "🛡️ Paid/leaked material is blocked; only legal/public links are indexed.\n\n"
         "👇 Select your exam:",
         reply_markup=main_menu_kb(msg.from_user.id)
     )
 
-@app.on_message(filters.command("stats") & filters.private)
+@app.on_message(filters.command("stats") & (filters.private | filters.group))
 @safe
 async def cmd_stats(_, msg: Message):
     up = int(time.time() - BOT_START_TIME)
@@ -1026,7 +1067,7 @@ async def cmd_stats(_, msg: Message):
         f"🚀 Burst Workers: `{BURST_WORKERS}`"
     )
 
-@app.on_message(filters.command("search") & filters.private)
+@app.on_message(filters.command("search") & (filters.private | filters.group))
 @safe
 async def cmd_search(client, msg: Message):
     query = msg.text.replace("/search", "").strip()
@@ -1044,10 +1085,11 @@ async def cmd_search(client, msg: Message):
     for b in batch:
         if isinstance(b, list):
             for item in b:
-                if item["url"] not in seen and valid_url(item["url"]):
+                if item["url"] not in seen and valid_url(item["url"]) and is_source_allowed(item["url"], item.get("title", "")):
                     seen.add(item["url"])
                     results.append(item)
-    results = results[:300]
+    results = sorted(results, key=lambda r: (source_policy(r.get("url", ""), r.get("title", "")) == "trusted", is_probably_pdf_url(r.get("url", ""))), reverse=True)
+    results = results[:MAX_RESULTS_PER_SEARCH]
     if not results:
         return await wait.edit_text("❌ No results found. Try different keywords.")
 
@@ -1055,7 +1097,7 @@ async def cmd_search(client, msg: Message):
     await store_session(sid, results)
     await wait.edit_text(
         f"✅ Found **{len(results)}** results for `{query}`\n\n"
-        "🔷 DDG  🔶 Bing  🔴 Google\n"
+        "🔷 DDG  🔶 Bing  🔴 Google | 🛡️ legal/public sources only\n"
         "Tap title → open | 📥 → download",
         reply_markup=results_kb(results, 1, "CUSTOM", query[:20], 0, "pyq", sid),
         disable_web_page_preview=True
@@ -1086,7 +1128,7 @@ async def callback_router(client, cq: CallbackQuery):
             "3️⃣ Tap 📥 to download PDF directly to chat\n\n"
             "🔍 `/search` for custom keyword search\n"
             "📊 `/stats` for bot status\n\n"
-            "🔷 DDG  🔶 Bing  🔴 Google  📱 Telegram",
+            "🔷 DDG  🔶 Bing  🔴 Google | 🛡️ paid/leaked sources blocked",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Menu", callback_data="back_main")]
             ])
@@ -1268,7 +1310,7 @@ async def start_services():
             MONGO_URI, maxPoolSize=20, minPoolSize=2,
             serverSelectionTimeoutMS=4000
         )
-        MONGO_DB = client_db[db_name]   
+        MONGO_DB = client_db[db_name]
         await MONGO_DB.command("ping")
         await MONGO_DB.search_cache.create_index("ts", expireAfterSeconds=86400)
         await MONGO_DB.sessions.create_index("ts",    expireAfterSeconds=7200)
