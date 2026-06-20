@@ -361,8 +361,10 @@ def safe(func):
         except FloodWait as fw:
             await asyncio.sleep(fw.value + 1)
             return await func(*args, **kwargs)
-        except (MessageNotModified, Exception):
+        except MessageNotModified:
             pass
+        except Exception as e:
+            log.error("handler_crash", handler=func.__name__, error=str(e))
     return wrapper
 
 # ─────────────────────────────────────────────
@@ -698,17 +700,15 @@ def mattype_kb(exam_key: str, region_hash: str, year: int) -> InlineKeyboardMark
     return InlineKeyboardMarkup(rows)
 
 # ─────────────────────────────────────────────
-#  FIX #2: results_kb() — callback_data size guard (64 byte Telegram limit)
-#  sid already hashed to 24 chars; exam_key max ~14, region_hash 8, year 4, mat 8
-#  Total max ~65 chars — trimmed exam_key to 12 chars to stay safe
+#  results_kb() — pagination via sid (no exam_key truncation needed)
+#  callback_data: "page|{sid}|{page}" — sid is 24 chars, total ~32 chars, well within 64-byte limit
+#  router handles "page|" separately and loads session by sid directly
 # ─────────────────────────────────────────────
 def results_kb(results: List[Dict], page: int, exam_key: str, region_hash: str, year: int, mat: str, sid: str) -> InlineKeyboardMarkup:
     per_page, rows = 10, []
     start = (page - 1) * per_page
     sliced = results[start:start + per_page]
     icon_map = {"DDG": "🔷", "Bing": "🔶", "Google": "🔴", "Google-API": "🟢", "Telegram": "📱"}
-    # Trim exam_key to 12 chars to keep callback_data within 64-byte Telegram limit
-    ek_safe = exam_key[:12]
     for i, item in enumerate(sliced):
         icon = icon_map.get(item.get("source", ""), "🔗")
         short = item["title"][:35] + "..." if len(item["title"]) > 35 else item["title"]
@@ -717,8 +717,9 @@ def results_kb(results: List[Dict], page: int, exam_key: str, region_hash: str, 
             InlineKeyboardButton("📥 PDF", callback_data=f"dl|{sid}|{start+i}")
         ])
     nav = []
-    if page > 1: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"dosearch|{ek_safe}|{region_hash}|{year}|{mat}|{page-1}"))
-    if start + per_page < len(results): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"dosearch|{ek_safe}|{region_hash}|{year}|{mat}|{page+1}"))
+    # "page|{sid}|{page}" — safe short callback, EXAM_TREE lookup not needed here
+    if page > 1: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page|{sid}|{page-1}"))
+    if start + per_page < len(results): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page|{sid}|{page+1}"))
     if nav: rows.append(nav)
     total_pages = -(-len(results) // per_page)
     rows.append([
@@ -856,6 +857,12 @@ async def router_callback(_, cq: CallbackQuery):
             await store_session(sid, res)
         if not res: return await cq.message.edit_text("❌ No structural data found.", reply_markup=main_menu_kb(cq.from_user.id))
         return await cq.message.edit_text("Scraped links:", reply_markup=results_kb(res, int(p), ek, rh, int(y), mat, sid))
+    # FIX #3: sid-based pagination handler — no EXAM_TREE key lookup needed
+    if d.startswith("page|"):
+        _, sid, p = d.split("|")
+        res = await load_session(sid)
+        if not res: return await cq.answer("Session expired. Please search again.", show_alert=True)
+        return await cq.message.edit_text("Scraped links:", reply_markup=results_kb(res, int(p), "", "", 0, "", sid))
     if d.startswith("dl|"):
         _, sid, idx = d.split("|")
         res = await load_session(sid)
@@ -889,8 +896,13 @@ async def redis_queue_puller_task():
                 jh = hashlib.sha256(p['url'].encode()).hexdigest()
                 if await REDIS.get(f"processed_job:{jh}"):
                     await REDIS.lrem("processing_dl_queue", 1, item); continue
-                DOWNLOAD_QUEUE.put_nowait(("app_ref", p['chat_id'], p['url'], p['title'], p['user_id']))
-                await REDIS.lrem("processing_dl_queue", 1, item)
+                try:
+                    DOWNLOAD_QUEUE.put_nowait(("app_ref", p['chat_id'], p['url'], p['title'], p['user_id']))
+                    await REDIS.lrem("processing_dl_queue", 1, item)
+                except asyncio.QueueFull:
+                    log.warning("redis_puller_queue_full_backing_off")
+                    await asyncio.sleep(1)
+                    continue
         except Exception: await asyncio.sleep(2)
 
 async def system_cleanup_loop():
